@@ -1,0 +1,32 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build binary
+        run: go build -o /tmp/threadgraph .
+
+      - name: Regression — synthetic leaks (expect 5)
+        run: |
+          /tmp/threadgraph run --no-llm ./testdata/buggy/ 2>/dev/null | grep "5 goroutine leaks"
+
+      - name: Regression — chan-receive-leak (expect 1)
+        run: |
+          /tmp/threadgraph run --no-llm ./testdata/chan-receive-leak/ 2>/dev/null | grep "1 goroutine leak"

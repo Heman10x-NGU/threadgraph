@@ -1,0 +1,17 @@
+# Compiled binary
+threadgraph
+*.exe
+
+# Go test artifacts
+*.out
+trace-*.bin
+/tmp/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
