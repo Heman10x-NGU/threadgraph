@@ -149,6 +149,51 @@ func expandPackages(args []string) ([]string, error) {
 	return pkgs, nil
 }
 
+// RaceResult holds the combined output of a race-enabled test run.
+type RaceResult struct {
+	Output   string
+	ExitCode int
+}
+
+// RunRace executes `go test -race -timeout <duration> <args...>` and returns
+// the combined output (stdout+stderr), which contains any race detector reports.
+// Sets GORACE=atexit_sleep_ms=0 to suppress the default 1s shutdown delay.
+func RunRace(args []string, duration time.Duration, extraEnv ...string) (*RaceResult, error) {
+	pkgs, err := expandPackages(args)
+	if err != nil {
+		return nil, fmt.Errorf("list packages: %w", err)
+	}
+
+	var allOutput strings.Builder
+	worstExit := 0
+
+	raceEnv := append([]string{"GORACE=atexit_sleep_ms=0"}, extraEnv...)
+
+	for _, pkg := range pkgs {
+		timeout := fmt.Sprintf("%.0fs", duration.Seconds())
+		cmdArgs := []string{"test", "-race", "-timeout", timeout, pkg}
+
+		cmd := exec.Command("go", cmdArgs...)
+		cmd.Env = append(os.Environ(), raceEnv...)
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				if exitErr.ExitCode() > worstExit {
+					worstExit = exitErr.ExitCode()
+				}
+			}
+			// Don't abort — race output may still be in out.
+		}
+		allOutput.Write(out)
+	}
+
+	return &RaceResult{
+		Output:   allOutput.String(),
+		ExitCode: worstExit,
+	}, nil
+}
+
 func tempTraceFile() (string, error) {
 	dir := os.TempDir()
 	f, err := os.CreateTemp(dir, "threadgraph-*.out")

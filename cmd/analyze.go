@@ -58,6 +58,8 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	baselineErr := applyBaseline(result)
+
 	out, cleanup, err := outputWriter()
 	if err != nil {
 		return err
@@ -66,11 +68,14 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 
 	switch flagFormat {
 	case "json":
-		return reporter.WriteJSON(out, result, explanation)
+		if err := reporter.WriteJSON(out, result, explanation); err != nil {
+			return err
+		}
 	default:
 		reporter.WriteTerminal(out, result, explanation)
-		return nil
 	}
+
+	return baselineErr
 }
 
 // outputWriter returns a writer for the output destination (file or stdout).

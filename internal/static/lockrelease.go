@@ -6,6 +6,7 @@ package static
 import (
 	"fmt"
 	"go/token"
+	"go/types"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -25,8 +26,14 @@ type Finding struct {
 // releasing it on all exit paths.
 //
 // Uses go/ssa control-flow analysis: for each Lock() call, it checks whether
-// every path from that point to a function exit passes through Unlock().
-// Functions with defer Unlock() are skipped (defer covers all exits).
+// every path from that point to a function exit passes through a matching
+// Unlock() on the same mutex receiver. Functions with defer Unlock() are
+// skipped (defer covers all exits).
+//
+// Two fixes over the original implementation:
+//  1. Method iteration: methods are NOT in pkg.Members; accessed via MethodSets.
+//  2. Receiver-aware matching: "same mutex" is determined by structural value ID
+//     so that r.mu.Unlock() does not cancel a pending r.client.mu.RLock().
 func AnalyzeLockRelease(pkgPatterns []string) ([]Finding, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
@@ -45,7 +52,6 @@ func AnalyzeLockRelease(pkgPatterns []string) ([]Finding, error) {
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
 
-	// Check for load errors
 	var loadErrs []string
 	for _, pkg := range loaded {
 		for _, e := range pkg.Errors {
@@ -60,19 +66,43 @@ func AnalyzeLockRelease(pkgPatterns []string) ([]Finding, error) {
 	prog.Build()
 
 	var findings []Finding
+	seen := make(map[*ssa.Function]bool)
+
+	var analyzeWithAnon func(fn *ssa.Function)
+	analyzeWithAnon = func(fn *ssa.Function) {
+		if fn == nil || seen[fn] {
+			return
+		}
+		seen[fn] = true
+		findings = append(findings, analyzeFn(fn)...)
+		for _, anon := range fn.AnonFuncs {
+			analyzeWithAnon(anon)
+		}
+	}
+
 	for _, pkg := range pkgs {
 		if pkg == nil {
 			continue
 		}
 		for _, mem := range pkg.Members {
-			fn, ok := mem.(*ssa.Function)
-			if !ok {
-				continue
-			}
-			findings = append(findings, analyzeFn(fn)...)
-			// Check anonymous functions (closures) within this function.
-			for _, anon := range fn.AnonFuncs {
-				findings = append(findings, analyzeFn(anon)...)
+			switch m := mem.(type) {
+			case *ssa.Function:
+				// Top-level package function.
+				analyzeWithAnon(m)
+
+			case *ssa.Type:
+				// Named type — iterate both T and *T method sets.
+				// Methods are NOT in pkg.Members; they require prog.MethodValue().
+				named, ok := m.Type().(*types.Named)
+				if !ok {
+					continue
+				}
+				for _, t := range []types.Type{named, types.NewPointer(named)} {
+					mset := prog.MethodSets.MethodSet(t)
+					for i := 0; i < mset.Len(); i++ {
+						analyzeWithAnon(prog.MethodValue(mset.At(i)))
+					}
+				}
 			}
 		}
 	}
@@ -80,8 +110,7 @@ func AnalyzeLockRelease(pkgPatterns []string) ([]Finding, error) {
 	return findings, nil
 }
 
-// isLockCall returns true if fn is sync.Mutex.Lock, sync.RWMutex.Lock, or
-// sync.RWMutex.RLock.
+// isLockCall returns true if fn is a mutex Lock or RLock method.
 func isLockCall(fn *ssa.Function) bool {
 	if fn == nil {
 		return false
@@ -92,8 +121,7 @@ func isLockCall(fn *ssa.Function) bool {
 		s == "(*sync.RWMutex).RLock"
 }
 
-// isUnlockCall returns true if fn is sync.Mutex.Unlock, sync.RWMutex.Unlock,
-// or sync.RWMutex.RUnlock.
+// isUnlockCall returns true if fn is a mutex Unlock or RUnlock method.
 func isUnlockCall(fn *ssa.Function) bool {
 	if fn == nil {
 		return false
@@ -104,34 +132,81 @@ func isUnlockCall(fn *ssa.Function) bool {
 		s == "(*sync.RWMutex).RUnlock"
 }
 
-// calleeFunc extracts the static callee from a CallCommon, or returns nil for
-// interface/dynamic calls.
+// calleeFunc extracts the static callee from a CallCommon.
 func calleeFunc(c ssa.CallCommon) *ssa.Function {
 	if c.IsInvoke() {
-		return nil // interface call
+		return nil
 	}
 	fn, _ := c.Value.(*ssa.Function)
 	return fn
 }
 
-// lockSite records where a Lock() call appears.
+// receiverOf returns the receiver argument of a sync.Mutex/RWMutex call.
+// In go/ssa, method calls are represented as c.Args[0] = the receiver pointer.
+func receiverOf(c ssa.CallCommon) ssa.Value {
+	if len(c.Args) > 0 {
+		return c.Args[0]
+	}
+	return nil
+}
+
+// valueID computes a structural identity string for an SSA value by walking
+// its definition chain. Two distinct SSA values that access the same struct
+// field path from the same base will produce the same valueID, making it
+// suitable for "same mutex" comparisons across multiple accesses in a function.
+//
+// Example: both occurrences of "r.client.mu" in a function produce
+// the same valueID even though they are different *ssa.Value objects.
+func valueID(v ssa.Value) string {
+	if v == nil {
+		return "nil"
+	}
+	switch v := v.(type) {
+	case *ssa.Parameter:
+		return "param:" + v.Name()
+	case *ssa.FreeVar:
+		return "freevar:" + v.Name()
+	case *ssa.Global:
+		return "global:" + v.RelString(nil)
+	case *ssa.FieldAddr:
+		return fmt.Sprintf("(%s).f%d", valueID(v.X), v.Field)
+	case *ssa.UnOp:
+		if v.Op == token.MUL {
+			return "*(" + valueID(v.X) + ")"
+		}
+	case *ssa.Alloc:
+		// Local allocations are unique per instruction — use their name.
+		return "alloc:" + v.Name()
+	}
+	// Fallback: use the SSA value name. This prevents false positives (we
+	// conservatively treat unknown values as distinct) but may miss some bugs.
+	return "?" + v.Name()
+}
+
+// lockSite records where a Lock() call appears, including which mutex.
 type lockSite struct {
-	block *ssa.BasicBlock
-	idx   int       // instruction index within the block
-	pos   token.Pos // source position
+	block       *ssa.BasicBlock
+	idx         int       // instruction index within the block
+	pos         token.Pos // source position
+	receiverID  string    // structural identity of the mutex receiver
+}
+
+// unlockEntry records a single Unlock() call with its mutex receiver ID.
+type unlockEntry struct {
+	idx        int
+	receiverID string
 }
 
 // analyzeFn checks whether fn has a lock acquired on some path without a
-// corresponding release on all exit paths.
+// corresponding release on all exit paths (receiver-aware).
 func analyzeFn(fn *ssa.Function) []Finding {
 	if len(fn.Blocks) == 0 {
 		return nil
 	}
 
-	// Phase 1: find all Lock() and Unlock() sites, and defer Unlock().
 	var lockSites []lockSite
-	// unlockIdx[blockIndex] = list of instruction indices with Unlock() calls.
-	unlockIdx := make(map[int][]int)
+	// unlocksByBlock[blockIndex] = list of (idx, receiverID) for Unlock() calls.
+	unlocksByBlock := make(map[int][]unlockEntry)
 	hasDeferUnlock := false
 
 	for _, b := range fn.Blocks {
@@ -139,33 +214,30 @@ func analyzeFn(fn *ssa.Function) []Finding {
 			switch v := instr.(type) {
 			case *ssa.Call:
 				callee := calleeFunc(v.Call)
+				recv := receiverOf(v.Call)
 				if isLockCall(callee) {
-					lockSites = append(lockSites, lockSite{b, ii, v.Pos()})
+					lockSites = append(lockSites, lockSite{b, ii, v.Pos(), valueID(recv)})
 				} else if isUnlockCall(callee) {
-					unlockIdx[b.Index] = append(unlockIdx[b.Index], ii)
+					unlocksByBlock[b.Index] = append(unlocksByBlock[b.Index], unlockEntry{ii, valueID(recv)})
 				}
 			case *ssa.Defer:
 				callee := calleeFunc(v.Call)
 				if isUnlockCall(callee) {
-					// defer Unlock() covers all exit paths — function is safe.
 					hasDeferUnlock = true
 				}
 			}
 		}
 	}
 
-	// If no locks, or defer Unlock() covers all paths, nothing to report.
 	if len(lockSites) == 0 || hasDeferUnlock {
 		return nil
 	}
 
-	// Phase 2: for each Lock() site, check whether all CFG paths from that
-	// point to a function exit pass through an Unlock().
 	var findings []Finding
 	fset := fn.Prog.Fset
 
 	for _, ls := range lockSites {
-		if pathExistsWithoutUnlock(fn, ls, unlockIdx) {
+		if pathExistsWithoutMatchingUnlock(fn, ls, unlocksByBlock) {
 			pos := fset.Position(ls.pos)
 			findings = append(findings, Finding{
 				Function: fn.RelString(nil),
@@ -178,31 +250,20 @@ func analyzeFn(fn *ssa.Function) []Finding {
 	return findings
 }
 
-// pathExistsWithoutUnlock returns true if there is at least one path from the
-// Lock() instruction (ls) to a function exit that does not pass through any
-// Unlock() call.
+// pathExistsWithoutMatchingUnlock returns true if there is at least one path
+// from the Lock() instruction (ls) to a function exit that does not pass
+// through a matching Unlock() on the same mutex receiver.
 //
-// Algorithm:
-//  1. Check the rest of ls.block after the Lock() instruction for an Unlock().
-//     If found, the lock is released within the same block and we need not
-//     propagate to successors from that point.
-//  2. BFS over successor blocks. A block "consumes" the lock-held state if it
-//     contains an Unlock() — we stop propagating through that block.
-//  3. If BFS reaches a block with no successors (function exit) without having
-//     passed through an Unlock(), return true.
-func pathExistsWithoutUnlock(fn *ssa.Function, ls lockSite, unlockIdx map[int][]int) bool {
-	// Check rest of the lock's block (instructions after the Lock() call).
-	if hasUnlockAfterIdx(ls.block, ls.idx+1, unlockIdx) {
-		// Unlocked in the same block — safe along paths that go through this block.
-		// We still need to check: are there paths through the successors that
-		// bypass this block's unlock? No — same-block unlock means the lock IS
-		// released before control leaves the block.
+// "Same mutex" is determined by receiverID (structural value path).
+func pathExistsWithoutMatchingUnlock(fn *ssa.Function, ls lockSite, unlocksByBlock map[int][]unlockEntry) bool {
+	// Check rest of the lock's own block.
+	if hasMatchingUnlockAfterIdx(ls.block, ls.idx+1, ls.receiverID, unlocksByBlock) {
 		return false
 	}
 
-	// BFS from the lock block's successors.
+	// BFS over successor blocks.
 	visited := make(map[int]bool)
-	queue := make([]*ssa.BasicBlock, 0, len(ls.block.Succs))
+	var queue []*ssa.BasicBlock
 	for _, succ := range ls.block.Succs {
 		if !visited[succ.Index] {
 			visited[succ.Index] = true
@@ -214,19 +275,16 @@ func pathExistsWithoutUnlock(fn *ssa.Function, ls lockSite, unlockIdx map[int][]
 		cur := queue[0]
 		queue = queue[1:]
 
-		// If this block has an Unlock(), the lock is released here — don't
-		// propagate further from this block.
-		if len(unlockIdx[cur.Index]) > 0 {
+		// If this block has a matching Unlock(), lock is released here.
+		if hasMatchingUnlockInBlock(cur, ls.receiverID, unlocksByBlock) {
 			continue
 		}
 
-		// No unlock in this block. If it's an exit block (no successors),
-		// we have found a path without unlock.
+		// Exit block reached without matching unlock.
 		if len(cur.Succs) == 0 {
 			return true
 		}
 
-		// Continue BFS.
 		for _, succ := range cur.Succs {
 			if !visited[succ.Index] {
 				visited[succ.Index] = true
@@ -238,11 +296,18 @@ func pathExistsWithoutUnlock(fn *ssa.Function, ls lockSite, unlockIdx map[int][]
 	return false
 }
 
-// hasUnlockAfterIdx returns true if block b has an Unlock() call at an
-// instruction index >= fromIdx.
-func hasUnlockAfterIdx(b *ssa.BasicBlock, fromIdx int, unlockIdx map[int][]int) bool {
-	for _, ui := range unlockIdx[b.Index] {
-		if ui >= fromIdx {
+func hasMatchingUnlockAfterIdx(b *ssa.BasicBlock, fromIdx int, receiverID string, unlocksByBlock map[int][]unlockEntry) bool {
+	for _, u := range unlocksByBlock[b.Index] {
+		if u.idx >= fromIdx && (receiverID == "" || u.receiverID == "" || u.receiverID == receiverID) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMatchingUnlockInBlock(b *ssa.BasicBlock, receiverID string, unlocksByBlock map[int][]unlockEntry) bool {
+	for _, u := range unlocksByBlock[b.Index] {
+		if receiverID == "" || u.receiverID == "" || u.receiverID == receiverID {
 			return true
 		}
 	}

@@ -1,10 +1,13 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +72,9 @@ func buildPrompt(findings []detector.Finding) string {
 
 	for i, f := range findings {
 		sb.WriteString(fmt.Sprintf("Issue %d: %s (confidence: %s)\n", i+1, f.Kind, f.Confidence))
+		if f.Count > 1 {
+			sb.WriteString(fmt.Sprintf("  Affects %d goroutines simultaneously\n", f.Count))
+		}
 		sb.WriteString(fmt.Sprintf("  Goroutine %d is blocked on: %q\n", f.GoroutineID, f.BlockedOn))
 		if f.BlockedFor > 0 {
 			sb.WriteString(fmt.Sprintf("  Blocked for: %v\n", f.BlockedFor.Round(time.Millisecond)))
@@ -82,6 +88,10 @@ func buildPrompt(findings []detector.Finding) string {
 		if f.Stack != "" {
 			sb.WriteString(fmt.Sprintf("  Stack trace:\n%s", f.Stack))
 		}
+		// Attach source code context if readable (20-line window centred on the bug line).
+		if ctx := readCodeContext(f.Location, 10); ctx != "" {
+			sb.WriteString(fmt.Sprintf("  Source code context:\n%s\n", ctx))
+		}
 		sb.WriteString("\n")
 	}
 
@@ -91,5 +101,54 @@ func buildPrompt(findings []detector.Finding) string {
 	sb.WriteString("3. Show a before/after code diff if possible\n")
 	sb.WriteString("4. Keep explanations concise and actionable\n")
 
+	return sb.String()
+}
+
+// readCodeContext reads a ±radius line window around the line indicated by a
+// "file:line" location string. Returns an empty string if the file cannot be
+// read or the location is not parseable (e.g. runtime internals).
+func readCodeContext(location string, radius int) string {
+	if location == "" {
+		return ""
+	}
+	// Split "file:line" — last colon separates the line number.
+	lastColon := strings.LastIndex(location, ":")
+	if lastColon < 0 {
+		return ""
+	}
+	filePath := location[:lastColon]
+	lineNo, err := strconv.Atoi(location[lastColon+1:])
+	if err != nil || lineNo <= 0 {
+		return ""
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "" // file not accessible (e.g. stdlib, vendor)
+	}
+	defer f.Close()
+
+	start := lineNo - radius
+	if start < 1 {
+		start = 1
+	}
+	end := lineNo + radius
+
+	var sb strings.Builder
+	scanner := bufio.NewScanner(f)
+	current := 1
+	for scanner.Scan() {
+		if current > end {
+			break
+		}
+		if current >= start {
+			marker := "  "
+			if current == lineNo {
+				marker = "→ "
+			}
+			sb.WriteString(fmt.Sprintf("%s%4d: %s\n", marker, current, scanner.Text()))
+		}
+		current++
+	}
 	return sb.String()
 }

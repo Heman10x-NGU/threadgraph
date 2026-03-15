@@ -13,6 +13,7 @@ type jsonFinding struct {
 	Kind          string `json:"kind"`
 	Confidence    string `json:"confidence"`
 	GoroutineID   uint64 `json:"goroutine_id"`
+	Count         int    `json:"count"`
 	BlockedOn     string `json:"blocked_on"`
 	BlockedForMs  int64  `json:"blocked_for_ms"`
 	Function      string `json:"function,omitempty"`
@@ -38,10 +39,15 @@ func WriteJSON(w io.Writer, result *detector.Result, explanation string) error {
 	}
 
 	for _, f := range result.Findings {
+		count := f.Count
+		if count < 1 {
+			count = 1
+		}
 		jf := jsonFinding{
 			Kind:         string(f.Kind),
 			Confidence:   string(f.Confidence),
 			GoroutineID:  uint64(f.GoroutineID),
+			Count:        count,
 			BlockedOn:    f.BlockedOn,
 			BlockedForMs: f.BlockedFor.Round(time.Millisecond).Milliseconds(),
 			Function:     f.Function,

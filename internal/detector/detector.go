@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/exp/trace"
@@ -17,7 +18,9 @@ const (
 	KindGoroutineLeak Kind = "goroutine_leak"
 	KindDeadlock      Kind = "deadlock"
 	KindLongBlock     Kind = "long_block"
-	KindLockLeak      Kind = "lock_leak" // static analysis: lock not released on all paths
+	KindLockLeak      Kind = "lock_leak"  // static analysis: lock not released on all paths
+	KindLockOrder     Kind = "lock_order" // static analysis: lock ordering cycle (AB-BA potential deadlock)
+	KindDataRace      Kind = "data_race"  // race detector: concurrent unsynchronized memory access
 )
 
 // Confidence indicates how certain we are about a finding.
@@ -45,6 +48,10 @@ type Finding struct {
 	Stack       string
 	Function    string // top user-code function
 	Location    string // file:line of top user-code frame
+	// Count is the number of goroutines with the same (kind, location)
+	// signature. After deduplication, a Count > 1 means multiple goroutines
+	// are exhibiting the same bug from the same call site.
+	Count int
 }
 
 // Result holds all findings from one analysis pass.
@@ -80,11 +87,11 @@ type goroutineState struct {
 	creationLocation string // file:line at creation site
 
 	// transient long block: most recent completed block that exceeded threshold
-	prevLongBlockReason    string
-	prevLongBlockStack     string
-	prevLongBlockFunction  string
-	prevLongBlockLocation  string
-	prevLongBlockDuration  time.Duration
+	prevLongBlockReason   string
+	prevLongBlockStack    string
+	prevLongBlockFunction string
+	prevLongBlockLocation string
+	prevLongBlockDuration time.Duration
 
 	// Lock sequence history: circular buffer of last syncHistorySize sync unblocks.
 	// Used for both AB-BA detection (single prevSyncLocation) and multi-step cycle detection.
@@ -98,6 +105,15 @@ type goroutineState struct {
 
 	// Death tracking: set when goroutine transitions to GoNotExist.
 	goroutineDead bool
+
+	// Provenance tree: parent goroutine ID (0 if root or unknown).
+	// Set when a GoCreate event is observed while another goroutine is running.
+	parentID trace.GoID
+
+	// isTestOwned is set by markTestOwned() after the full trace parse.
+	// True if this goroutine is descended from the testing framework.
+	// Only test-owned goroutines are reported as findings.
+	isTestOwned bool
 }
 
 // syncHistoryList returns recent sync unblock entries, most recent first.
@@ -169,8 +185,11 @@ func Analyze(path string, opts Options) (*Result, error) {
 		}
 		g := goroutines[gid]
 
-		// Goroutine created — record provenance (creation stack)
+		// Goroutine created — record provenance (creation stack + parent ID).
+		// ev.Goroutine() is the goroutine that executed the 'go' statement;
+		// st.Resource.Goroutine() (= gid) is the newly created child.
 		if from == trace.GoNotExist {
+			g.parentID = ev.Goroutine()
 			g.creationStack, g.creationFunction, g.creationLocation = extractStack(st.Stack)
 			g.creationSeen = true
 		}
@@ -224,16 +243,27 @@ func Analyze(path string, opts Options) (*Result, error) {
 
 	traceDuration := time.Duration(lastTime-firstTime) * time.Nanosecond
 
+	// Walk the goroutine parent-child tree to mark all goroutines descended
+	// from the testing framework as test-owned. Only test-owned goroutines
+	// are eligible for findings.
+	markTestOwned(goroutines)
+
 	if opts.DebugFiltered {
 		printDebugFiltered(goroutines, lastTime, traceDuration)
 	}
 
-	findings := detectLeaks(goroutines, lastTime, opts)
+	findings := detectLeaks(goroutines, lastTime, traceDuration, opts)
 	findings = append(findings, detectDeadlocks(goroutines, lastTime, opts)...)
 	findings = append(findings, detectTransientBlocks(goroutines, opts)...)
-	findings = append(findings, detectABBA(goroutines, lastTime)...)
+	findings = append(findings, detectLockCycles(goroutines, lastTime)...)
 	findings = append(findings, detectChanLockCycle(goroutines, lastTime)...)
 	findings = append(findings, detectOrphans(goroutines, traceDuration)...)
+	findings = append(findings, detectWaitGroupDeadlock(goroutines, lastTime)...)
+
+	// Deduplicate: collapse N goroutines with the same (kind, location) into
+	// one finding with Count = N. Reduces noise on leaks that affect many
+	// goroutines simultaneously from the same call site.
+	findings = deduplicateFindings(findings)
 
 	return &Result{
 		TraceFile:          path,
@@ -241,6 +271,107 @@ func Analyze(path string, opts Options) (*Result, error) {
 		GoroutinesAnalyzed: len(goroutines),
 		Findings:           findings,
 	}, nil
+}
+
+// deduplicateFindings collapses findings with the same (kind, location) into a
+// single representative, setting Count to the total number of affected
+// goroutines. The goroutine blocked the longest is kept as the representative.
+// Insertion order is preserved so output is deterministic.
+func deduplicateFindings(findings []Finding) []Finding {
+	type key struct {
+		kind     Kind
+		location string
+	}
+	type group struct {
+		rep   Finding
+		count int
+	}
+
+	groups := make(map[key]*group)
+	var order []key
+
+	for _, f := range findings {
+		k := key{f.Kind, f.Location}
+		if g, ok := groups[k]; ok {
+			g.count++
+			if f.BlockedFor > g.rep.BlockedFor {
+				saved := g.count
+				g.rep = f
+				g.count = saved
+			}
+		} else {
+			cp := f
+			groups[k] = &group{rep: cp, count: 1}
+			order = append(order, k)
+		}
+	}
+
+	out := make([]Finding, 0, len(order))
+	for _, k := range order {
+		g := groups[k]
+		g.rep.Count = g.count
+		out = append(out, g.rep)
+	}
+	return out
+}
+
+// markTestOwned performs a BFS from "test root" goroutines (those created by
+// the testing framework or that pre-existed the trace as the main goroutine)
+// and marks every reachable descendant as isTestOwned = true.
+//
+// Only test-owned goroutines are reported as findings; this eliminates false
+// positives from pre-test global background workers and goroutines spawned by
+// unrelated infrastructure that happens to be running during the test.
+func markTestOwned(goroutines map[trace.GoID]*goroutineState) {
+	// Build parent→children adjacency list from captured parentIDs.
+	children := make(map[trace.GoID][]trace.GoID)
+	for gid, g := range goroutines {
+		if g.parentID != 0 {
+			children[g.parentID] = append(children[g.parentID], gid)
+		}
+	}
+
+	owned := make(map[trace.GoID]bool)
+	var queue []trace.GoID
+
+	for gid, g := range goroutines {
+		if isTestRoot(g) {
+			owned[gid] = true
+			queue = append(queue, gid)
+		}
+	}
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, child := range children[cur] {
+			if !owned[child] {
+				owned[child] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+
+	for gid, g := range goroutines {
+		g.isTestOwned = owned[gid]
+	}
+}
+
+// isTestRoot returns true if g should be treated as a root of the test goroutine
+// tree, meaning all its descendants are considered test-owned.
+//
+// Three categories qualify:
+//  1. Goroutines directly created by testing.tRunner (the per-test goroutine).
+//  2. Goroutines currently executing testing.tRunner (same, seen mid-trace).
+//  3. Pre-trace goroutines (!creationSeen): in 'go test', goroutine 1 (main)
+//     always pre-exists and is the ancestor of all testing goroutines. We
+//     include all pre-trace goroutines as roots; runtime-only descendants are
+//     still excluded by the isRuntimeGoroutine(g.stack) check in detectors.
+func isTestRoot(g *goroutineState) bool {
+	return strings.Contains(g.creationStack, "testing.tRunner") ||
+		strings.Contains(g.creationStack, "testing.runTests") ||
+		strings.Contains(g.stack, "testing.tRunner") ||
+		!g.creationSeen
 }
 
 // printDebugFiltered prints all blocked goroutines with their filter status.

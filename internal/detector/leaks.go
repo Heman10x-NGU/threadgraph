@@ -9,52 +9,40 @@ import (
 // detectLeaks finds goroutines still blocked at the end of the trace.
 // Goroutines blocked on "chan send" or "chan receive" are classified as leaks.
 // Others blocked longer than minBlock are classified as long blocks.
-func detectLeaks(goroutines map[trace.GoID]*goroutineState, lastTime trace.Time, opts Options) []Finding {
+//
+// traceDuration is the full trace window used to compute the lifetime ratio
+// (blockDuration / traceDuration). A ratio near 1.0 means the goroutine was
+// blocked for nearly the entire trace — higher confidence of a real leak.
+func detectLeaks(goroutines map[trace.GoID]*goroutineState, lastTime trace.Time, traceDuration time.Duration, opts Options) []Finding {
 	var findings []Finding
 
 	for gid, g := range goroutines {
 		if !g.isBlocked {
 			continue
 		}
-		// Filter by blocking stack (always applies)
+		// Only report goroutines that are part of the test's goroutine tree.
+		// This eliminates pre-test global workers and unrelated infrastructure.
+		if !g.isTestOwned {
+			continue
+		}
+		// Filter by blocking stack: pure runtime goroutines are never findings.
 		if isRuntimeGoroutine(g.stack) {
 			continue
 		}
-		// Skip the main goroutine sleeping intentionally
+		// Skip the main goroutine sleeping intentionally (e.g. time.Sleep in test).
 		if g.reason == "sleep" {
 			continue
 		}
 
-		isChanBlock := g.reason == "chan send" || g.reason == "chan receive"
-		// Go execution traces use "sync" as the reason for ALL sync primitives
-		// (sync.Mutex.Lock, sync.RWMutex.Lock/RLock, sync.Cond.Wait, etc.)
-		isSyncBlock := g.reason == "sync"
-
-		// Provenance filter: apply only to channel blocks.
-		// For sync blocks (mutex/RWMutex/condvar) we trust the blocking stack
-		// check above — test goroutines that deadlock on mutexes have user code
-		// in their blocking stack but runtime/testing code in their creation
-		// stack, so the creation-stack filter would incorrectly exclude them.
-		if isChanBlock {
-			if !g.creationSeen {
-				continue
-			}
-			// Only filter goroutines created by non-testing runtime code (e.g.
-			// net/http workers). Goroutines created by testing.T.Run have a
-			// testing-only creation stack but ARE test-owned and should be reported.
-			if isNonTestRuntimeGoroutine(g.creationStack) {
-				continue
-			}
-		}
-		// For non-channel, non-sync blocks (select, etc.) still require
-		// provenance to avoid background worker false positives.
-		if !isChanBlock && !isSyncBlock {
-			if !g.creationSeen || isNonTestRuntimeGoroutine(g.creationStack) {
-				continue
-			}
-		}
-
 		blocked := time.Duration(lastTime-g.blockStart) * time.Nanosecond
+
+		// Lifetime ratio: fraction of the trace window this goroutine has been
+		// continuously blocked. ratio → 1.0 = blocked since trace start (definite
+		// leak); ratio → 0 = just started blocking (might be transient).
+		blockRatio := 1.0
+		if traceDuration > 0 {
+			blockRatio = float64(blocked) / float64(traceDuration)
+		}
 
 		var kind Kind
 		var conf Confidence
@@ -62,14 +50,27 @@ func detectLeaks(goroutines map[trace.GoID]*goroutineState, lastTime trace.Time,
 		switch g.reason {
 		case "chan send", "chan receive":
 			kind = KindGoroutineLeak
-			conf = ConfidenceHigh
+			// Confidence scaled by lifetime ratio.
+			switch {
+			case blockRatio >= 0.85:
+				conf = ConfidenceHigh
+			case blockRatio >= 0.40:
+				conf = ConfidenceMedium
+			default:
+				conf = ConfidenceLow
+			}
 		default:
 			// Only report long blocks if they exceed the threshold
 			if blocked < opts.MinBlock {
 				continue
 			}
 			kind = KindLongBlock
-			conf = ConfidenceMedium
+			switch {
+			case blockRatio >= 0.85:
+				conf = ConfidenceMedium // long blocks are at most Medium
+			default:
+				conf = ConfidenceLow
+			}
 		}
 
 		findings = append(findings, Finding{
@@ -107,11 +108,8 @@ func detectOrphans(goroutines map[trace.GoID]*goroutineState, traceDuration time
 		if g.isBlocked {
 			continue // already caught by other detectors
 		}
-		if !g.creationSeen {
-			continue // pre-test goroutine, not interesting
-		}
-		if isNonTestRuntimeGoroutine(g.creationStack) {
-			continue // non-testing runtime background goroutine
+		if !g.isTestOwned {
+			continue // pre-test or unrelated goroutine
 		}
 		// Function/location from creation stack (goroutine never blocked, so
 		// g.function/g.location from the blocking stack are empty).

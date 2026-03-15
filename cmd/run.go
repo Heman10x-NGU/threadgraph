@@ -103,12 +103,13 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 	defer os.Remove(traceToClean)
 
-	// Optional: go/ssa static lock-release analysis.
+	// Optional: go/ssa static analysis bundle (--static flag).
 	if flagStatic {
+		// 1. Lock-release analysis: find locks not released on all exit paths.
 		fmt.Fprintln(os.Stderr, "Running static lock-release analysis...")
 		staticFindings, serr := static.AnalyzeLockRelease(args)
 		if serr != nil {
-			fmt.Fprintf(os.Stderr, "warn: static analysis: %v\n", serr)
+			fmt.Fprintf(os.Stderr, "warn: static lock-release analysis: %v\n", serr)
 		} else {
 			for _, sf := range staticFindings {
 				result.Findings = append(result.Findings, detector.Finding{
@@ -120,6 +121,55 @@ func runRun(cmd *cobra.Command, args []string) error {
 					Location:    sf.Location,
 				})
 			}
+		}
+
+		// 2. Lock-ordering analysis: find AB-BA (and N-way) lock ordering cycles.
+		fmt.Fprintln(os.Stderr, "Running static lock-ordering analysis...")
+		orderFindings, oerr := static.AnalyzeLockOrder(args)
+		if oerr != nil {
+			fmt.Fprintf(os.Stderr, "warn: static lock-ordering analysis: %v\n", oerr)
+		} else {
+			for _, of := range orderFindings {
+				result.Findings = append(result.Findings, detector.Finding{
+					Kind:        detector.KindLockOrder,
+					Confidence:  detector.ConfidenceMedium,
+					GoroutineID: 0,
+					BlockedOn:   of.Message,
+					Function:    of.Function,
+					Location:    of.Location,
+				})
+			}
+		}
+
+		// 3. Chan-lock holding analysis: find functions that hold a mutex while
+		// blocking on a channel operation (same-struct mutex+channel pattern).
+		fmt.Fprintln(os.Stderr, "Running static chan-lock holding analysis...")
+		chanLockFindings, clerr := static.AnalyzeChanLockHolding(args)
+		if clerr != nil {
+			fmt.Fprintf(os.Stderr, "warn: static chan-lock analysis: %v\n", clerr)
+		} else {
+			for _, clf := range chanLockFindings {
+				result.Findings = append(result.Findings, detector.Finding{
+					Kind:        detector.KindLockOrder,
+					Confidence:  detector.ConfidenceLow,
+					GoroutineID: 0,
+					BlockedOn:   clf.Message,
+					Function:    clf.Function,
+					Location:    clf.Location,
+				})
+			}
+		}
+	}
+
+	// Optional: data race detection (--race flag).
+	if flagRace {
+		fmt.Fprintln(os.Stderr, "Running data race detection (go test -race)...")
+		raceOut, rerr := tracer.RunRace(args, duration)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "warn: race detection: %v\n", rerr)
+		} else {
+			raceFindings := detector.ParseRaceOutput(raceOut.Output)
+			result.Findings = append(result.Findings, raceFindings...)
 		}
 	}
 
@@ -136,6 +186,8 @@ func runRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	baselineErr := applyBaseline(result)
+
 	out, cleanup, err := outputWriter()
 	if err != nil {
 		return err
@@ -144,11 +196,14 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 	switch flagFormat {
 	case "json":
-		return reporter.WriteJSON(out, result, explanation)
+		if err := reporter.WriteJSON(out, result, explanation); err != nil {
+			return err
+		}
 	default:
 		reporter.WriteTerminal(out, result, explanation)
-		return nil
 	}
+
+	return baselineErr
 }
 
 // scheduleDiversityValues returns the GOMAXPROCS values to retry with when no

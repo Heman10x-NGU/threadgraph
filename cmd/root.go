@@ -11,6 +11,9 @@ var (
 	flagMinBlock      string
 	flagDebugFiltered bool
 	flagStatic        bool
+	flagRace          bool
+	flagSaveBaseline  string
+	flagBaseline      string
 )
 
 var rootCmd = &cobra.Command{
@@ -36,4 +39,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagMinBlock, "min-block", "1s", "Minimum block duration to flag as a long block (e.g. 500ms, 2s)")
 	rootCmd.PersistentFlags().BoolVar(&flagDebugFiltered, "debug-filtered", false, "Print goroutines filtered from findings to stderr (diagnostic)")
 	rootCmd.PersistentFlags().BoolVar(&flagStatic, "static", false, "Also run go/ssa static lock-release analysis (requires package source)")
+	rootCmd.PersistentFlags().BoolVar(&flagRace, "race", false, "Also run go test -race to detect data races (requires CGO)")
+	rootCmd.PersistentFlags().StringVar(&flagSaveBaseline, "save-baseline", "", "Save current findings as a baseline to file (for future --baseline comparisons)")
+	rootCmd.PersistentFlags().StringVar(&flagBaseline, "baseline", "", "Compare findings against baseline file; exit 1 only if NEW findings are detected")
 }

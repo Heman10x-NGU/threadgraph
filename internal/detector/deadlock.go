@@ -1,6 +1,9 @@
 package detector
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/exp/trace"
@@ -40,6 +43,9 @@ func detectDeadlocks(goroutines map[trace.GoID]*goroutineState, lastTime trace.T
 
 	for gid, g := range goroutines {
 		if !g.isBlocked {
+			continue
+		}
+		if !g.isTestOwned {
 			continue
 		}
 		if isRuntimeGoroutine(g.stack) {
@@ -92,88 +98,181 @@ func detectDeadlocks(goroutines map[trace.GoID]*goroutineState, lastTime trace.T
 	return findings
 }
 
-// detectABBA detects AB-BA lock order inversions using lock sequence history.
+// detectLockCycles replaces the O(n²) AB-BA heuristic with a full
+// Tarjan Strongly-Connected-Component (SCC) search on the lock-wait graph.
 //
-// Algorithm: for each goroutine G1 that is blocked on "sync" at location L_wait,
-// we look at its recent sync-unblock history (goroutineState.syncHistory) — each
-// entry represents a lock site G1 recently acquired. For each such acquired lock
-// L_held, we add the directed edge L_held → L_wait ("G1 holds L_held, waits for
-// L_wait"). If goroutine G2 has the reverse edge L_wait → L_held, it's an AB-BA
-// deadlock: G1 holds A and waits for B, G2 holds B and waits for A.
+// Graph construction:
+//   - Node  = a lock call site (file:line string)
+//   - Edge A→B = "some goroutine recently held a lock at A and is now
+//     waiting for a lock at B"
 //
-// Using syncHistory instead of only prevSyncLocation allows detecting AB-BA when
-// the first lock was acquired multiple operations ago (multi-step lock sequences).
+// Any SCC with ≥ 2 nodes represents a lock-ordering cycle:
+//   - Size 2: classic AB-BA (G1 holds A waits B, G2 holds B waits A)
+//   - Size N: multi-goroutine cycle (catches 3-way, 4-way, …)
 //
-// Confidence is Medium because two goroutines at the same call site might
-// use different mutex instances.
-func detectABBA(goroutines map[trace.GoID]*goroutineState, lastTime trace.Time) []Finding {
-	type lockEdge struct {
-		from string // lock held (recently unblocked from sync at this site)
-		to   string // lock being waited on (current block site)
-		gid  trace.GoID
-		g    *goroutineState
+// Complexity: O(V+E) — Tarjan's algorithm is linear in graph size.
+// The previous AB-BA check was O(E²) in the number of edges.
+func detectLockCycles(goroutines map[trace.GoID]*goroutineState, lastTime trace.Time) []Finding {
+	type graphEdge struct {
+		to  string
+		gid trace.GoID
+		g   *goroutineState
 	}
 
-	var edges []lockEdge
+	adj := make(map[string][]graphEdge)
+
 	for gid, g := range goroutines {
 		if !g.isBlocked || g.reason != "sync" {
+			continue
+		}
+		if !g.isTestOwned {
 			continue
 		}
 		if isRuntimeGoroutine(g.stack) {
 			continue
 		}
-
-		// Use the full sync history to catch multi-step lock sequences.
 		for _, entry := range g.syncHistoryList() {
 			if entry.location == "" || entry.location == g.location {
-				// Same call site: single-goroutine double lock, caught by detectDeadlocks.
 				continue
 			}
 			age := time.Duration(lastTime-entry.endTime) * time.Nanosecond
 			if age > abbaStaleWindow {
-				// Too old: the lock was likely released long ago.
 				continue
 			}
-			edges = append(edges, lockEdge{
-				from: entry.location,
-				to:   g.location,
-				gid:  gid,
-				g:    g,
+			adj[entry.location] = append(adj[entry.location], graphEdge{
+				to: g.location, gid: gid, g: g,
 			})
 		}
 	}
 
-	var findings []Finding
-	seen := make(map[[2]string]bool) // deduplicate by edge pair
+	if len(adj) == 0 {
+		return nil
+	}
 
-	for i := 0; i < len(edges); i++ {
-		for j := i + 1; j < len(edges); j++ {
-			e1, e2 := edges[i], edges[j]
-			if e1.from != e2.to || e1.to != e2.from {
-				continue
-			}
-			// Canonical key: sort the two locations so (A,B) == (B,A)
-			k := [2]string{e1.from, e1.to}
-			if k[0] > k[1] {
-				k[0], k[1] = k[1], k[0]
-			}
-			if seen[k] {
-				continue
-			}
-			seen[k] = true
-
-			blocked := time.Duration(lastTime-e1.g.blockStart) * time.Nanosecond
-			findings = append(findings, Finding{
-				Kind:        KindDeadlock,
-				Confidence:  ConfidenceMedium,
-				GoroutineID: e1.gid,
-				BlockedOn:   "sync (AB-BA lock inversion)",
-				BlockedFor:  blocked,
-				Stack:       e1.g.stack,
-				Function:    e1.g.function,
-				Location:    e1.g.location,
-			})
+	// Collect all nodes (both endpoints of every edge).
+	nodeSet := make(map[string]bool)
+	for from, edges := range adj {
+		nodeSet[from] = true
+		for _, e := range edges {
+			nodeSet[e.to] = true
 		}
+	}
+
+	// --- Tarjan's SCC ---
+	type nodeState struct {
+		index   int
+		lowlink int
+		onStack bool
+		visited bool
+	}
+	states := make(map[string]*nodeState, len(nodeSet))
+	var sccStack []string
+	var sccs [][]string
+	nextIndex := 0
+
+	var strongConnect func(v string)
+	strongConnect = func(v string) {
+		s := &nodeState{index: nextIndex, lowlink: nextIndex, onStack: true, visited: true}
+		states[v] = s
+		nextIndex++
+		sccStack = append(sccStack, v)
+
+		for _, edge := range adj[v] {
+			w := edge.to
+			ws, visited := states[w]
+			if !visited {
+				strongConnect(w)
+				if states[w].lowlink < s.lowlink {
+					s.lowlink = states[w].lowlink
+				}
+			} else if ws.onStack {
+				if ws.index < s.lowlink {
+					s.lowlink = ws.index
+				}
+			}
+		}
+
+		// v is the root of a completed SCC.
+		if s.lowlink == s.index {
+			var scc []string
+			for {
+				w := sccStack[len(sccStack)-1]
+				sccStack = sccStack[:len(sccStack)-1]
+				states[w].onStack = false
+				scc = append(scc, w)
+				if w == v {
+					break
+				}
+			}
+			if len(scc) >= 2 {
+				sccs = append(sccs, scc)
+			}
+		}
+	}
+
+	for node := range nodeSet {
+		if s, ok := states[node]; !ok || !s.visited {
+			strongConnect(node)
+		}
+	}
+
+	// --- Map each SCC to a Finding ---
+	var findings []Finding
+	seenSCC := make(map[string]bool)
+
+	for _, scc := range sccs {
+		sccSet := make(map[string]bool, len(scc))
+		for _, node := range scc {
+			sccSet[node] = true
+		}
+
+		// Representative = goroutine blocked the longest within the cycle.
+		var bestGID trace.GoID
+		var bestG *goroutineState
+		var bestBlocked time.Duration
+
+		for _, from := range scc {
+			for _, edge := range adj[from] {
+				if !sccSet[edge.to] {
+					continue
+				}
+				blocked := time.Duration(lastTime-edge.g.blockStart) * time.Nanosecond
+				if blocked > bestBlocked {
+					bestBlocked = blocked
+					bestGID = edge.gid
+					bestG = edge.g
+				}
+			}
+		}
+		if bestG == nil {
+			continue
+		}
+
+		// Canonical dedup key: sort SCC node list and join.
+		sorted := make([]string, len(scc))
+		copy(sorted, scc)
+		sort.Strings(sorted)
+		key := strings.Join(sorted, "|")
+		if seenSCC[key] {
+			continue
+		}
+		seenSCC[key] = true
+
+		cycleDesc := "sync (AB-BA lock inversion)"
+		if len(scc) > 2 {
+			cycleDesc = fmt.Sprintf("sync (%d-way lock cycle)", len(scc))
+		}
+
+		findings = append(findings, Finding{
+			Kind:        KindDeadlock,
+			Confidence:  ConfidenceMedium,
+			GoroutineID: bestGID,
+			BlockedOn:   cycleDesc,
+			BlockedFor:  bestBlocked,
+			Stack:       bestG.stack,
+			Function:    bestG.function,
+			Location:    bestG.location,
+		})
 	}
 
 	return findings
@@ -191,6 +290,9 @@ func detectChanLockCycle(goroutines map[trace.GoID]*goroutineState, lastTime tra
 		if !g.isBlocked || g.reason != "sync" {
 			continue
 		}
+		if !g.isTestOwned {
+			continue
+		}
 		if isRuntimeGoroutine(g.stack) {
 			continue
 		}
@@ -205,6 +307,9 @@ func detectChanLockCycle(goroutines map[trace.GoID]*goroutineState, lastTime tra
 			continue
 		}
 		if g.reason != "chan send" && g.reason != "chan receive" {
+			continue
+		}
+		if !g.isTestOwned {
 			continue
 		}
 		if g.prevSyncLocation == "" {
@@ -236,6 +341,102 @@ func detectChanLockCycle(goroutines map[trace.GoID]*goroutineState, lastTime tra
 			Function:    g.function,
 			Location:    g.location,
 		})
+	}
+
+	return findings
+}
+
+// detectWaitGroupDeadlock finds goroutines blocked on sync.WaitGroup.Wait()
+// whose ALL live descendant goroutines are also blocked — meaning wg.Done()
+// will never be called and the Wait() will never return.
+//
+// Algorithm:
+//  1. Find goroutines blocked on "sync" whose stack contains WaitGroup.Wait
+//  2. For each such goroutine, BFS its descendant tree (via parentID)
+//  3. If every live (non-dead) descendant is blocked → deadlock confirmed
+//
+// This catches the case Claude's HANDOFF.md identified: cockroach/1462-style
+// WaitGroup + Channel deadlocks where wg.Wait() hangs because children are
+// all stuck on unbuffered channels.
+func detectWaitGroupDeadlock(goroutines map[trace.GoID]*goroutineState, lastTime trace.Time) []Finding {
+	// Build parent → children adjacency list.
+	children := make(map[trace.GoID][]trace.GoID)
+	for gid, g := range goroutines {
+		if g.parentID != 0 {
+			children[g.parentID] = append(children[g.parentID], gid)
+		}
+	}
+
+	var findings []Finding
+	seen := make(map[trace.GoID]bool) // avoid duplicate reports
+
+	for gid, g := range goroutines {
+		if !g.isBlocked {
+			continue
+		}
+		if !g.isTestOwned {
+			continue
+		}
+		if g.reason != "sync" {
+			continue
+		}
+		// Check if this goroutine is blocked specifically on WaitGroup.Wait
+		if !strings.Contains(g.stack, "sync.(*WaitGroup).Wait") {
+			continue
+		}
+		if seen[gid] {
+			continue
+		}
+
+		// BFS all descendants of this goroutine
+		allDescendantsBlocked := true
+		hasDescendants := false
+		queue := children[gid]
+		visited := map[trace.GoID]bool{gid: true}
+
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			if visited[cur] {
+				continue
+			}
+			visited[cur] = true
+
+			desc, ok := goroutines[cur]
+			if !ok {
+				continue
+			}
+			// Skip dead goroutines — they completed normally (called wg.Done())
+			if desc.goroutineDead {
+				continue
+			}
+
+			hasDescendants = true
+
+			if !desc.isBlocked {
+				// A live, unblocked descendant exists — it might still call wg.Done()
+				allDescendantsBlocked = false
+				break
+			}
+
+			// Continue BFS into this descendant's children
+			queue = append(queue, children[cur]...)
+		}
+
+		if hasDescendants && allDescendantsBlocked {
+			seen[gid] = true
+			blocked := time.Duration(lastTime-g.blockStart) * time.Nanosecond
+			findings = append(findings, Finding{
+				Kind:        KindDeadlock,
+				Confidence:  ConfidenceMedium,
+				GoroutineID: gid,
+				BlockedOn:   "sync.WaitGroup.Wait (all descendants blocked — wg.Done() unreachable)",
+				BlockedFor:  blocked,
+				Stack:       g.stack,
+				Function:    g.function,
+				Location:    g.location,
+			})
+		}
 	}
 
 	return findings
