@@ -5,7 +5,7 @@
 [![CI](https://github.com/Heman10x-NGU/threadgraph/actions/workflows/ci.yml/badge.svg)](https://github.com/Heman10x-NGU/threadgraph/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/go-1.22+-00ADD8.svg)](go.mod)
-[![GoBench](https://img.shields.io/badge/GoBench%20GoKer-62%2F68%20(91%25)-brightgreen)](GOBENCH_RESULTS.md)
+[![GoBench](https://img.shields.io/badge/GoBench%20GoKer-64%2F68%20(94%25)-brightgreen)](GOBENCH_RESULTS.md)
 
 ---
 
@@ -80,6 +80,8 @@ ThreadGraph Analysis
 | AB-BA lock inversion   | Crossed lock acquisition history          | Medium     |
 | Channel-lock cycle     | Lock holder blocked on channel            | Medium     |
 | Lock leak (static)     | go/ssa CFG: lock path without unlock      | Low        |
+| N-way lock cycle       | Tarjan's SCC on lock-acquisition graph    | Medium     |
+| Data race              | Go race detector output parsing           | High       |
 | Orphan goroutine       | Created but never scheduled               | Low        |
 
 ## GoBench Benchmark
@@ -93,6 +95,7 @@ Tested against [GoBench GoKer](https://github.com/timmyyuan/gobench) — 68 real
 | v0.1    | 31/68 (45%) | Basic leak detection |
 | v0.2    | 59/68 (86%) | AB-BA, chan+lock cycle, schedule diversity |
 | v0.3    | 62/68 (91%) | `testing.T.Run` provenance fix, syncHistory |
+| v0.4    | 64/68 (94%) | Goroutine provenance tree, Tarjan's SCC N-way deadlock, receiver-aware mutex matching |
 
 **False positives on `net/http/httptest` (224 goroutines): 0**
 
@@ -104,12 +107,13 @@ ThreadGraph runs `go test -trace` on your package — no binary modification nee
 It parses the Go execution trace (a structured binary log of every goroutine state
 transition) and applies 6 detection algorithms:
 
-- **detectLeaks** — goroutines blocked on channels at trace end
+- **detectLeaks** — goroutines blocked on channels at trace end (with lifetime-ratio confidence scoring)
 - **detectDeadlocks** — mutex contention groups by call site
-- **detectABBA** — crossed lock-acquisition history across goroutines
+- **detectLockCycles** — N-way lock ordering cycles via Tarjan's SCC algorithm (catches 3-goroutine deadlocks)
 - **detectChanLockCycle** — goroutines holding a lock while waiting on a channel
 - **detectOrphans** — goroutines that never ran before the test exited
 - **detectTransientBlocks** — mutex deadlocks unblocked by test timeout
+- **AnalyzeLockRelease** (`--static`) — go/ssa CFG analysis for locks not released on all code paths
 
 If no bugs are found on the first pass, it automatically retries with GOMAXPROCS=1, 2,
 and 4 to expose scheduling-dependent bugs that only manifest under specific interleavings.
@@ -129,19 +133,21 @@ threadgraph run ./...
 ## Flags
 
 ```
---format string     Output format: terminal (default) or json
---no-llm            Skip Claude AI explanations
---output string     Write output to file instead of stdout
---min-block string  Minimum block duration to report (default "500ms")
---static            Enable go/ssa static lock-release analysis
---debug-filtered    Print all blocked goroutines with filter status to stderr
+--format string          Output format: terminal (default) or json
+--no-llm                 Skip Claude AI explanations
+--output string          Write output to file instead of stdout
+--min-block string       Minimum block duration to report (default "500ms")
+--static                 Enable go/ssa static lock-release analysis
+--debug-filtered         Print all blocked goroutines with filter status to stderr
+--save-baseline string   Save current findings as a baseline JSON file
+--baseline string        Suppress known findings; exit 1 only on new regressions
 ```
 
 ## Roadmap
 
-- [ ] Goroutine provenance tree — eliminate false positives in server code
-- [ ] Source code context in AI explanations (20-line window around finding)
-- [ ] CI baseline comparison (`--save-baseline` / `--baseline`)
+- [x] Goroutine provenance tree — BFS from `testing.T` roots; only test-owned goroutines reported
+- [x] Source code context in AI explanations (±10-line window around finding)
+- [x] CI baseline comparison (`--save-baseline` / `--baseline`)
 - [ ] VS Code extension with inline annotations
 - [ ] GitHub PR check — "this PR introduced 2 goroutine leaks"
 - [ ] Production sampling mode (LeakProf-style pprof for long-running services)
